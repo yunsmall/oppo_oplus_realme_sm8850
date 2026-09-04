@@ -707,6 +707,9 @@ jobs:
           export CC="$(pwd)/cc-wrapper" && export LD="$(pwd)/ld-wrapper" &&
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out Image
           # 编译可加载内核模块(config 中 =m 的组件), 须紧跟 Image 构建, 以复用同一套 cc-wrapper/时间劫持/ccache 编译环境
+          # 先满足 modpost 依赖: Android GKI 源码的 modpost 要读源码根的"受保护模块清单"文件(由官方 build 脚本生成),
+          # 手动 make 不会生成它; 自编内核没有受保护模块, 建空文件即可让 vmlinux.symvers 规则通过
+          touch protected_module_names_list
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out modules || {
             echo "错误: 内核模块编译失败"; exit 1; }
           # 按标准布局安装到 lib/modules/<release> 并跑 depmod 生成 modules.dep 等依赖文件,
