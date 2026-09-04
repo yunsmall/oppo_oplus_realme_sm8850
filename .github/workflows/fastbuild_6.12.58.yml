@@ -854,18 +854,17 @@ jobs:
           export HOSTCC=clang HOSTLD=ld.lld LD=ld.lld AR=llvm-ar NM=llvm-nm AS=clang READELF=llvm-readelf
           export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump OBJSIZE=llvm-size STRIP=llvm-strip
           export RUSTC="rustc" BINDGEN="bindgen" CC="clang" LIBCLANG_PATH="$WORKDIR/kernel_workspace/clang19/lib"
-          # 先用真实 clang 完成 config 同步: 独立 step 会让 make 重新评估并触发 syncconfig, 而 cc-wrapper 内的 ccache 会把
-          # Kconfig 的编译器探测参数(-v 等)当自身选项拦截, 导致 unknown C compiler 中止; 同步后 make modules 不再探测即可正常用 cc-wrapper
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out syncconfig
-          # 编译可加载内核模块(config 中 =m 的组件), 复用 Image 阶段生成的 cc-wrapper/ld-wrapper(内含时间劫持与 ccache)
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out modules || {
+          # 直接用 clang 编译模块(经 PATH 里 /usr/lib/ccache 的 ccache 前缀缓存): cc-wrapper 内的 ccache 会把 Kconfig 编译器探测
+          # 参数当自身选项拦截导致 unknown C compiler; 而模块 CRC 取决于符号内容与 prefix-map 路径, 与 Image 的时间劫持无关,
+          # 故不经 wrapper 直编也能与 Image 符号一致可正常加载
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out modules || {
             echo "错误: 内核模块编译失败"; exit 1; }
           # 按标准布局安装到 lib/modules/<release> 并跑 depmod 生成 modules.dep 等依赖文件,
           # 这样整树拷到设备的 /lib/modules 后即可用 modprobe 按模块名加载并自动处理依赖
           command -v depmod >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y kmod)
           INSTALL_MOD_PATH="$WORKDIR/kernel_workspace/modules_stage"
           rm -rf "$INSTALL_MOD_PATH"
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out INSTALL_MOD_PATH="$INSTALL_MOD_PATH" INSTALL_MOD_STRIP=1 modules_install || {
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out INSTALL_MOD_PATH="$INSTALL_MOD_PATH" INSTALL_MOD_STRIP=1 modules_install || {
             echo "错误: 内核模块安装(depmod)失败"; exit 1; }
           # 打包整个 modules 树, 命名与内核后缀对齐, 供 release 一并发布
           MODULES_TAG="${{ env.KERNEL_NAME }}"
