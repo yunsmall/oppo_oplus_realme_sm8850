@@ -713,6 +713,10 @@ jobs:
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out gki_defconfig &&
           export CC="$(pwd)/cc-wrapper" && export LD="$(pwd)/ld-wrapper" &&
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out Image
+          # 把 Image 编译现场的完整环境导出为快照文件, 供后续独立的模块 step source 精确还原,
+          # 这样模块与 Image 的 KCFLAGS/-Wno-error/ccache/PATH 等逐变量一致, 不靠手抄环境避免漏项
+          declare -px > "$WORKDIR/kernel_workspace/modules.env"
+          echo "已导出编译环境快照: $(wc -l < "$WORKDIR/kernel_workspace/modules.env") 个变量"
           # 编译后时间劫持二次校验
           echo "--- 编译后环境时间: $(LD_PRELOAD=$PRELOAD_LIBS date) ---"
           echo "--- 编译后环境文件时间戳: ---"
@@ -833,30 +837,14 @@ jobs:
         id: build_modules
         run: |
           WORKDIR="$(pwd)"
-          export PATH="/usr/lib/ccache:$PATH"
-          export PATH="$WORKDIR/kernel_workspace/clang19/bin:$PATH"
-          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
-          export PATH="$WORKDIR/kernel_workspace/rust/bin:$PATH"
-          export CCACHE_LOGFILE="${{ github.workspace }}/kernel_workspace/ccache.log"
-          export CCACHE_COMPILERCHECK="none"
-          export CCACHE_BASEDIR="${{ github.workspace }}"
-          export CCACHE_NOHASHDIR="true"
-          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
-          export CCACHE_MAXSIZE="3G"
-          export CCACHE_IS_KERNEL_COMPILING="true"
-          # 独立成 step 编译模块: Image/AK3 已在上一步打包并上传, 此处即使失败也不影响内核产物已保留(release 仍不会发)
-          cd kernel_workspace/common
-          # 6.12 的 gendwarfksyms 依赖路径重映射, 必须与 Image 构建完全一致, 否则模块 CRC 与内核对不上无法加载
-          COMMON_REAL_PATH=$(pwd -P)
-          ROOT_REAL_PATH=$(dirname "$COMMON_REAL_PATH")
-          export KCFLAGS="-fdebug-prefix-map=$ROOT_REAL_PATH=. -fmacro-prefix-map=$ROOT_REAL_PATH=. -ffile-prefix-map=$ROOT_REAL_PATH=. -no-canonical-prefixes -O2 -pipe -Wno-error -fno-stack-protector -D__ANDROID_COMMON_KERNEL__"
-          export LLVM=1 LLVM_IAS=1 ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
-          export HOSTCC=clang HOSTLD=ld.lld LD=ld.lld AR=llvm-ar NM=llvm-nm AS=clang READELF=llvm-readelf
-          export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump OBJSIZE=llvm-size STRIP=llvm-strip
-          export RUSTC="rustc" BINDGEN="bindgen" CC="clang" LIBCLANG_PATH="$WORKDIR/kernel_workspace/clang19/lib"
-          # 直接用 clang 编译模块(经 PATH 里 /usr/lib/ccache 的 ccache 前缀缓存): cc-wrapper 内的 ccache 会把 Kconfig 编译器探测
-          # 参数当自身选项拦截导致 unknown C compiler; 而模块 CRC 取决于符号内容与 prefix-map 路径, 与 Image 的时间劫持无关,
-          # 故不经 wrapper 直编也能与 Image 符号一致可正常加载
+          cd kernel_workspace
+          # 还原 Image 编译现场的环境快照, 与 Image 逐变量一致(重点: KCFLAGS 的 -Wno-error 与 prefix-map, ccache, PATH 工具链)
+          set -a
+          source modules.env
+          set +a
+          cd common
+          # 模块显式用 clang 直编: 快照里 CC 是 cc-wrapper, 其内部 ccache 会拦截 Kconfig 编译器探测参数致 unknown C compiler;
+          # 而模块 CRC 取决于符号内容与 prefix-map 路径, 与 Image 的时间劫持无关, clang 直编仍与 Image 一致可加载
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out modules || {
             echo "错误: 内核模块编译失败"; exit 1; }
           # 按标准布局安装到 lib/modules/<release> 并跑 depmod 生成 modules.dep 等依赖文件,
