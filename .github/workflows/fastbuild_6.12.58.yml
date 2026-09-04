@@ -107,7 +107,7 @@ jobs:
     outputs:
       ksuver: ${{ steps.ksu_version.outputs.ksuver }}
       ak3name: ${{ steps.create_zip.outputs.ak3name }}
-      modules_exist: ${{ steps.build_kernel.outputs.modules_exist }}
+      modules_exist: ${{ steps.build_modules.outputs.modules_exist }}
     permissions:
       actions: write
       contents: read
@@ -707,38 +707,12 @@ jobs:
           # 必须放在 make Image 之前: Image 构建 link vmlinux.o 后就会跑 modpost 生成 vmlinux.symvers(依赖此文件),
           # 若此时文件不存在会 No rule 失败, 而 Actions 默认 bash -e, 后续行(包括放 Image 后的 touch)不会再执行
           touch protected_module_names_list
+          # 关闭 IKHEADERS(把 include 头打包进内核供 BPF 等使用): 手动 make 时该特性在 modules 阶段会重跑 gen_kheaders.sh 二次打包,
+          # 在 OnePlus 树上 cpio 找不到 include/kunit 头导致中断, 而对编内核/模块毫无价值, 故禁用
+          echo "CONFIG_IKHEADERS=n" >> arch/arm64/configs/gki_defconfig
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out gki_defconfig &&
           export CC="$(pwd)/cc-wrapper" && export LD="$(pwd)/ld-wrapper" &&
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out Image
-          # 编译可加载内核模块(config 中 =m 的组件), 须紧跟 Image 构建, 以复用同一套 cc-wrapper/时间劫持/ccache 编译环境
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out modules || {
-            echo "错误: 内核模块编译失败"; exit 1; }
-          # 按标准布局安装到 lib/modules/<release> 并跑 depmod 生成 modules.dep 等依赖文件,
-          # 这样整树拷到设备的 /lib/modules 后即可用 modprobe 按模块名加载并自动处理依赖
-          command -v depmod >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y kmod)
-          INSTALL_MOD_PATH="$WORKDIR/kernel_workspace/modules_stage"
-          rm -rf "$INSTALL_MOD_PATH"
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out INSTALL_MOD_PATH="$INSTALL_MOD_PATH" INSTALL_MOD_STRIP=1 modules_install || {
-            echo "错误: 内核模块安装(depmod)失败"; exit 1; }
-          # 打包整个 modules 树, 命名与内核后缀对齐, 供 release 一并发布
-          MODULES_TAG="${{ env.KERNEL_NAME }}"
-          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
-            MODULES_TAG="${{ github.event.inputs.kernel_suffix }}"
-          fi
-          MODULES_ZIP="KernelModules_${MODULES_TAG}.zip"
-          KO_COUNT=$(find "$INSTALL_MOD_PATH" -name '*.ko' | wc -l)
-          echo "已安装内核模块数量: $KO_COUNT"
-          if [ "$KO_COUNT" -gt 0 ]; then
-            (cd "$INSTALL_MOD_PATH" && zip -qry "$WORKDIR/kernel_workspace/$MODULES_ZIP" lib)
-            echo "modules_exist=true" >> $GITHUB_OUTPUT
-            echo "模块包顶层结构:"
-            unzip -l "$WORKDIR/kernel_workspace/$MODULES_ZIP" | grep -E "modules\.(dep|alias|symbols|builtin)|lib/modules/[^/]+/$" | head
-            ls -lh "$WORKDIR/kernel_workspace/$MODULES_ZIP"
-          else
-            echo "本次 config 中没有 =m 模块, 跳过模块打包"
-            echo "modules_exist=false" >> $GITHUB_OUTPUT
-          fi
-
           # 编译后时间劫持二次校验
           echo "--- 编译后环境时间: $(LD_PRELOAD=$PRELOAD_LIBS date) ---"
           echo "--- 编译后环境文件时间戳: ---"
@@ -855,8 +829,62 @@ jobs:
           path: ${{ github.workspace }}/kernel_workspace/AnyKernel*.zip
           archive: false
 
+      - name: 编译并打包内核模块(=m 组件)
+        id: build_modules
+        run: |
+          WORKDIR="$(pwd)"
+          export PATH="/usr/lib/ccache:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/clang19/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/rust/bin:$PATH"
+          export CCACHE_LOGFILE="${{ github.workspace }}/kernel_workspace/ccache.log"
+          export CCACHE_COMPILERCHECK="none"
+          export CCACHE_BASEDIR="${{ github.workspace }}"
+          export CCACHE_NOHASHDIR="true"
+          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+          export CCACHE_MAXSIZE="3G"
+          export CCACHE_IS_KERNEL_COMPILING="true"
+          # 独立成 step 编译模块: Image/AK3 已在上一步打包并上传, 此处即使失败也不影响内核产物已保留(release 仍不会发)
+          cd kernel_workspace/common
+          # 6.12 的 gendwarfksyms 依赖路径重映射, 必须与 Image 构建完全一致, 否则模块 CRC 与内核对不上无法加载
+          COMMON_REAL_PATH=$(pwd -P)
+          ROOT_REAL_PATH=$(dirname "$COMMON_REAL_PATH")
+          export KCFLAGS="-fdebug-prefix-map=$ROOT_REAL_PATH=. -fmacro-prefix-map=$ROOT_REAL_PATH=. -ffile-prefix-map=$ROOT_REAL_PATH=. -no-canonical-prefixes -O2 -pipe -Wno-error -fno-stack-protector -D__ANDROID_COMMON_KERNEL__"
+          export LLVM=1 LLVM_IAS=1 ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          export HOSTCC=clang HOSTLD=ld.lld LD=ld.lld AR=llvm-ar NM=llvm-nm AS=clang READELF=llvm-readelf
+          export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump OBJSIZE=llvm-size STRIP=llvm-strip
+          export RUSTC="rustc" BINDGEN="bindgen" CC="clang" LIBCLANG_PATH="$WORKDIR/kernel_workspace/clang19/lib"
+          # 编译可加载内核模块(config 中 =m 的组件), 复用 Image 阶段生成的 cc-wrapper/ld-wrapper(内含时间劫持与 ccache)
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out modules || {
+            echo "错误: 内核模块编译失败"; exit 1; }
+          # 按标准布局安装到 lib/modules/<release> 并跑 depmod 生成 modules.dep 等依赖文件,
+          # 这样整树拷到设备的 /lib/modules 后即可用 modprobe 按模块名加载并自动处理依赖
+          command -v depmod >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y kmod)
+          INSTALL_MOD_PATH="$WORKDIR/kernel_workspace/modules_stage"
+          rm -rf "$INSTALL_MOD_PATH"
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out INSTALL_MOD_PATH="$INSTALL_MOD_PATH" INSTALL_MOD_STRIP=1 modules_install || {
+            echo "错误: 内核模块安装(depmod)失败"; exit 1; }
+          # 打包整个 modules 树, 命名与内核后缀对齐, 供 release 一并发布
+          MODULES_TAG="${{ env.KERNEL_NAME }}"
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            MODULES_TAG="${{ github.event.inputs.kernel_suffix }}"
+          fi
+          MODULES_ZIP="KernelModules_${MODULES_TAG}.zip"
+          KO_COUNT=$(find "$INSTALL_MOD_PATH" -name '*.ko' | wc -l)
+          echo "已安装内核模块数量: $KO_COUNT"
+          if [ "$KO_COUNT" -gt 0 ]; then
+            (cd "$INSTALL_MOD_PATH" && zip -qry "$WORKDIR/kernel_workspace/$MODULES_ZIP" lib)
+            echo "modules_exist=true" >> $GITHUB_OUTPUT
+            echo "模块包顶层结构:"
+            unzip -l "$WORKDIR/kernel_workspace/$MODULES_ZIP" | grep -E "modules\.(dep|alias|symbols|builtin)|lib/modules/[^/]+/$" | head
+            ls -lh "$WORKDIR/kernel_workspace/$MODULES_ZIP"
+          else
+            echo "本次 config 中没有 =m 模块, 跳过模块打包"
+            echo "modules_exist=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: 上传内核模块工件
-        if: steps.build_kernel.outputs.modules_exist == 'true'
+        if: steps.build_modules.outputs.modules_exist == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: kernel-modules
