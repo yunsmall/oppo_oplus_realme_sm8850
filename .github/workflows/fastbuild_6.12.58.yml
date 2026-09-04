@@ -710,6 +710,9 @@ jobs:
           # 关闭 IKHEADERS(把 include 头打包进内核供 BPF 等使用): 手动 make 时该特性在 modules 阶段会重跑 gen_kheaders.sh 二次打包,
           # 在 OnePlus 树上 cpio 找不到 include/kunit 头导致中断, 而对编内核/模块毫无价值, 故禁用
           echo "CONFIG_IKHEADERS=n" >> arch/arm64/configs/gki_defconfig
+          # 关闭 ZRAM: cctv18 树 backend_zstd.c 调用的 zstd_custom_mem 等 API 比树里 zstd.h 新, 仅在 make modules 编 zram.ko 时暴露而编译失败;
+          # 原厂本就是 zram=m 模块化, zram 由 vendor 的 zram.ko/zsmalloc.ko(vendor_boot dlkm)提供, 故内核不编 zram 模块既不重复也不触发该错误
+          echo "CONFIG_ZRAM=n" >> arch/arm64/configs/gki_defconfig
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out gki_defconfig &&
           export CC="$(pwd)/cc-wrapper" && export LD="$(pwd)/ld-wrapper" &&
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out Image
@@ -776,9 +779,9 @@ jobs:
           else
             KSU_TYPENAME="none"
           fi
-          if [[ "${{ github.event.inputs.lz4kd_enable }}" == "true" ]]; then
-            wget https://raw.githubusercontent.com/$GITHUB_REPOSITORY/refs/heads/$GITHUB_REF_NAME/zram.zip
-          fi
+          # zram.zip(magisk 模块) 带调整 swap 大小的 UI, 需要随包安装(其 service.sh 的 rmmod/insmod 在 vendor 已提供 zram 的机器上会因时机太晚失败,
+          # 实际 zram 由 vendor zram.ko 提供, 但 UI 仍可用于调节系统 zram); 无条件打进包, 不受 lz4kd 开关控制
+          wget https://raw.githubusercontent.com/$GITHUB_REPOSITORY/refs/heads/$GITHUB_REF_NAME/zram.zip
           if [[ ${{ github.event.inputs.kpm_enable }} == 'true' ]]; then
             wget https://github.com/cctv18/KPatch-Next/releases/latest/download/kpn.zip
           fi
