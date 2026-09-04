@@ -562,7 +562,16 @@ jobs:
           echo "CONFIG_BBG=y" >> ./common/arch/arm64/configs/gki_defconfig
           cd ./common
           curl -sSL https://github.com/cctv18/Baseband-guard/raw/master/setup.sh | bash
-          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
+          # 把 baseband_guard 并入 CONFIG_LSM:
+          # 自定义 config 常显式写死 CONFIG_LSM, 此时仅改 Kconfig 默认值不会生效(BBG 的 Makefile 检测到 BBG 不在 LSM 列表会直接中止编译),
+          # 所以优先就地改写 defconfig 文件里的显式 CONFIG_LSM 值(把 baseband_guard 插到 selinux 之后, 与上游默认注入位置一致);
+          # 仅当文件里没有显式 CONFIG_LSM 行时才退回改 security/Kconfig 的默认值
+          # 注意: 本 step 已 cd ./common, 故 gki_defconfig 相对路径以 ./arch/... 开头
+          if grep -q '^CONFIG_LSM=' ./arch/arm64/configs/gki_defconfig; then
+            sed -i '/^CONFIG_LSM=/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ }' ./arch/arm64/configs/gki_defconfig
+          else
+            sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
+          fi
 
       - name: 添加制作名称
         run: |
