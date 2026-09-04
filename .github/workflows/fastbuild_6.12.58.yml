@@ -96,7 +96,7 @@ on:
         type: string
         default: ''
       custom_config_url:
-        description: '自定义内核config直链URL(可选)。留空使用默认gki_defconfig；填写则先用该config整体覆盖gki_defconfig作为编译基底，下方各项功能开关(KSU/网络增强等)仍会按你勾选的选项叠加其上。推荐使用完整.config格式的raw直链'
+        description: '自定义内核config直链URL(可选)。留空使用默认gki_defconfig(可开机)；填写则把该config中的显式设置行(CONFIG_*=...)追加到默认gki_defconfig之后作为增量, 默认配置完整保留, 下方各项功能开关(KSU/网络增强等)仍会叠加。追加会忽略 # CONFIG_X is not set 注释行(避免关掉默认已开项), 要关某默认项请写 CONFIG_XXX=n'
         required: false
         type: string
         default: ''
@@ -256,23 +256,26 @@ jobs:
             ccache -sv
           fi
 
-      - name: 载入自定义内核配置(覆盖gki_defconfig)
+      - name: 载入自定义内核配置(追加到默认gki_defconfig)
         if: inputs.custom_config_url != ''
         run: |
           # 进入内核工作目录
           cd kernel_workspace
-          echo "检测到自定义内核配置URL，正在覆盖默认 gki_defconfig..."
-          curl -fLSs --retry 3 "${{ inputs.custom_config_url }}" -o common/arch/arm64/configs/gki_defconfig || {
+          echo "检测到自定义内核配置URL，正在追加到默认 gki_defconfig 之后..."
+          curl -fLSs --retry 3 "${{ inputs.custom_config_url }}" -o common/arch/arm64/configs/gki_defconfig.custom || {
             echo "错误: 自定义config下载失败，请检查URL是否可直连(需为raw直链)且有效"; exit 1; }
-          # 去掉可能混入的CRLF行尾与BOM，并确保文件以换行结尾，
-          # 否则后续注入步骤用 >> 追加时会把内容并到最后一行的行尾
-          sed -i 's/\r$//' common/arch/arm64/configs/gki_defconfig
-          sed -i '1s/^\xEF\xBB\xBF//' common/arch/arm64/configs/gki_defconfig
-          [ -n "$(tail -c1 common/arch/arm64/configs/gki_defconfig)" ] && echo "" >> common/arch/arm64/configs/gki_defconfig
-          echo "已覆盖，CONFIG_ 条目数: $(grep -c '^CONFIG_' common/arch/arm64/configs/gki_defconfig)"
-          head -n 3 common/arch/arm64/configs/gki_defconfig
-          if ! grep -q '^CONFIG_' common/arch/arm64/configs/gki_defconfig; then
+          # 去掉可能混入的CRLF行尾与BOM
+          sed -i 's/\r$//' common/arch/arm64/configs/gki_defconfig.custom
+          sed -i '1s/^\xEF\xBB\xBF//' common/arch/arm64/configs/gki_defconfig.custom
+          # 只提取显式设置行(CONFIG_*=...)追加到默认 gki_defconfig 之后, 丢弃 # CONFIG_X is not set 等注释行:
+          # 默认 gki_defconfig 是已验证可开机的基底, 若把整份 .config(含其中关闭项的注释行)直接并入,
+          # 会把 SYSVIPC/IPC_NS 等默认已开项关掉导致刷入无法开机; 要关某默认开的项请写 CONFIG_XXX=n
+          CNT=$(grep -c '^CONFIG_' common/arch/arm64/configs/gki_defconfig.custom || true)
+          if [ "$CNT" -eq 0 ]; then
             echo "错误: 下载内容不含任何 CONFIG_ 条目，看起来不是内核config文件"; exit 1; fi
+          grep '^CONFIG_' common/arch/arm64/configs/gki_defconfig.custom >> common/arch/arm64/configs/gki_defconfig
+          rm -f common/arch/arm64/configs/gki_defconfig.custom
+          echo "已将 $CNT 条自定义配置追加到默认 gki_defconfig 之后(默认配置完整保留)"
 
       - name: 添加KernelSU
         id: ksu_version
@@ -713,6 +716,11 @@ jobs:
           # 关闭 ZRAM: cctv18 树 backend_zstd.c 调用的 zstd_custom_mem 等 API 比树里 zstd.h 新, 仅在 make modules 编 zram.ko 时暴露而编译失败;
           # 原厂本就是 zram=m 模块化, zram 由 vendor 的 zram.ko/zsmalloc.ko(vendor_boot dlkm)提供, 故内核不编 zram 模块既不重复也不触发该错误
           echo "CONFIG_ZRAM=n" >> arch/arm64/configs/gki_defconfig
+          # 关闭 Rust binder: 独立模块 step 会把它编成 rust_binder.ko, 其引用的 init_ipc_ns/put_ipc_ns 仅在 CONFIG_IPC_NS=y 时
+          # 由 ipc/namespace.c 编入 vmlinux, config 未开 IPC_NS 时这两个符号不存在, modpost 报 undefined 使模块编译失败;
+          # 原厂走 C binder(CONFIG_ANDROID_BINDER_IPC), vendor 不需要内核 Rust binder, 关掉还能省掉每次全量编译 Rust 的时间
+          echo "CONFIG_ANDROID_BINDER_IPC_RUST=n" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_RUST=n" >> arch/arm64/configs/gki_defconfig
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out gki_defconfig &&
           export CC="$(pwd)/cc-wrapper" && export LD="$(pwd)/ld-wrapper" &&
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out Image
