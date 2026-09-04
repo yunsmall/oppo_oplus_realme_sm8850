@@ -712,7 +712,7 @@ jobs:
           # 按标准布局安装到 lib/modules/<release> 并跑 depmod 生成 modules.dep 等依赖文件,
           # 这样整树拷到设备的 /lib/modules 后即可用 modprobe 按模块名加载并自动处理依赖
           command -v depmod >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y kmod)
-          INSTALL_MOD_PATH="$WORKDIR/modules_stage"
+          INSTALL_MOD_PATH="$WORKDIR/kernel_workspace/modules_stage"
           rm -rf "$INSTALL_MOD_PATH"
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out INSTALL_MOD_PATH="$INSTALL_MOD_PATH" INSTALL_MOD_STRIP=1 modules_install || {
             echo "错误: 内核模块安装(depmod)失败"; exit 1; }
@@ -725,11 +725,11 @@ jobs:
           KO_COUNT=$(find "$INSTALL_MOD_PATH" -name '*.ko' | wc -l)
           echo "已安装内核模块数量: $KO_COUNT"
           if [ "$KO_COUNT" -gt 0 ]; then
-            (cd "$INSTALL_MOD_PATH" && zip -qry "$WORKDIR/$MODULES_ZIP" lib)
+            (cd "$INSTALL_MOD_PATH" && zip -qry "$WORKDIR/kernel_workspace/$MODULES_ZIP" lib)
             echo "modules_exist=true" >> $GITHUB_OUTPUT
             echo "模块包顶层结构:"
-            unzip -l "$WORKDIR/$MODULES_ZIP" | grep -E "modules\.(dep|alias|symbols|builtin)|lib/modules/[^/]+/$" | head
-            ls -lh "$WORKDIR/$MODULES_ZIP"
+            unzip -l "$WORKDIR/kernel_workspace/$MODULES_ZIP" | grep -E "modules\.(dep|alias|symbols|builtin)|lib/modules/[^/]+/$" | head
+            ls -lh "$WORKDIR/kernel_workspace/$MODULES_ZIP"
           else
             echo "本次 config 中没有 =m 模块, 跳过模块打包"
             echo "modules_exist=false" >> $GITHUB_OUTPUT
