@@ -95,6 +95,11 @@ on:
         required: false
         type: string
         default: ''
+      custom_config_url:
+        description: '自定义内核config直链URL(可选)。留空使用默认gki_defconfig；填写则先用该config整体覆盖gki_defconfig作为编译基底，下方各项功能开关(KSU/网络增强等)仍会按你勾选的选项叠加其上。推荐使用完整.config格式的raw直链'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   build:
@@ -249,6 +254,24 @@ jobs:
             echo "ccache缓存命中详情:"
             ccache -sv
           fi
+
+      - name: 载入自定义内核配置(覆盖gki_defconfig)
+        if: inputs.custom_config_url != ''
+        run: |
+          # 进入内核工作目录
+          cd kernel_workspace
+          echo "检测到自定义内核配置URL，正在覆盖默认 gki_defconfig..."
+          curl -fLSs --retry 3 "${{ inputs.custom_config_url }}" -o common/arch/arm64/configs/gki_defconfig || {
+            echo "错误: 自定义config下载失败，请检查URL是否可直连(需为raw直链)且有效"; exit 1; }
+          # 去掉可能混入的CRLF行尾与BOM，并确保文件以换行结尾，
+          # 否则后续注入步骤用 >> 追加时会把内容并到最后一行的行尾
+          sed -i 's/\r$//' common/arch/arm64/configs/gki_defconfig
+          sed -i '1s/^\xEF\xBB\xBF//' common/arch/arm64/configs/gki_defconfig
+          [ -n "$(tail -c1 common/arch/arm64/configs/gki_defconfig)" ] && echo "" >> common/arch/arm64/configs/gki_defconfig
+          echo "已覆盖，CONFIG_ 条目数: $(grep -c '^CONFIG_' common/arch/arm64/configs/gki_defconfig)"
+          head -n 3 common/arch/arm64/configs/gki_defconfig
+          if ! grep -q '^CONFIG_' common/arch/arm64/configs/gki_defconfig; then
+            echo "错误: 下载内容不含任何 CONFIG_ 条目，看起来不是内核config文件"; exit 1; fi
 
       - name: 添加KernelSU
         id: ksu_version
