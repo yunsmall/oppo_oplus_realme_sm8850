@@ -107,6 +107,7 @@ jobs:
     outputs:
       ksuver: ${{ steps.ksu_version.outputs.ksuver }}
       ak3name: ${{ steps.create_zip.outputs.ak3name }}
+      modules_exist: ${{ steps.build_kernel.outputs.modules_exist }}
     permissions:
       actions: write
       contents: read
@@ -584,6 +585,7 @@ jobs:
           echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
            
       - name: 构建内核
+        id: build_kernel
         run: |
           WORKDIR="$(pwd)"
           export PATH="/usr/lib/ccache:$PATH"
@@ -695,7 +697,35 @@ jobs:
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out gki_defconfig &&
           export CC="$(pwd)/cc-wrapper" && export LD="$(pwd)/ld-wrapper" &&
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out Image
-          
+          # 编译可加载内核模块(config 中 =m 的组件), 须紧跟 Image 构建, 以复用同一套 cc-wrapper/时间劫持/ccache 编译环境
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out modules || {
+            echo "错误: 内核模块编译失败"; exit 1; }
+          # 按标准布局安装到 lib/modules/<release> 并跑 depmod 生成 modules.dep 等依赖文件,
+          # 这样整树拷到设备的 /lib/modules 后即可用 modprobe 按模块名加载并自动处理依赖
+          command -v depmod >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y kmod)
+          INSTALL_MOD_PATH="$WORKDIR/modules_stage"
+          rm -rf "$INSTALL_MOD_PATH"
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out INSTALL_MOD_PATH="$INSTALL_MOD_PATH" INSTALL_MOD_STRIP=1 modules_install || {
+            echo "错误: 内核模块安装(depmod)失败"; exit 1; }
+          # 打包整个 modules 树, 命名与内核后缀对齐, 供 release 一并发布
+          MODULES_TAG="${{ env.KERNEL_NAME }}"
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            MODULES_TAG="${{ github.event.inputs.kernel_suffix }}"
+          fi
+          MODULES_ZIP="KernelModules_${MODULES_TAG}.zip"
+          KO_COUNT=$(find "$INSTALL_MOD_PATH" -name '*.ko' | wc -l)
+          echo "已安装内核模块数量: $KO_COUNT"
+          if [ "$KO_COUNT" -gt 0 ]; then
+            (cd "$INSTALL_MOD_PATH" && zip -qry "$WORKDIR/$MODULES_ZIP" lib)
+            echo "modules_exist=true" >> $GITHUB_OUTPUT
+            echo "模块包顶层结构:"
+            unzip -l "$WORKDIR/$MODULES_ZIP" | grep -E "modules\.(dep|alias|symbols|builtin)|lib/modules/[^/]+/$" | head
+            ls -lh "$WORKDIR/$MODULES_ZIP"
+          else
+            echo "本次 config 中没有 =m 模块, 跳过模块打包"
+            echo "modules_exist=false" >> $GITHUB_OUTPUT
+          fi
+
           # 编译后时间劫持二次校验
           echo "--- 编译后环境时间: $(LD_PRELOAD=$PRELOAD_LIBS date) ---"
           echo "--- 编译后环境文件时间戳: ---"
@@ -812,6 +842,14 @@ jobs:
           path: ${{ github.workspace }}/kernel_workspace/AnyKernel*.zip
           archive: false
 
+      - name: 上传内核模块工件
+        if: steps.build_kernel.outputs.modules_exist == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-modules
+          path: ${{ github.workspace }}/kernel_workspace/KernelModules*.zip
+          archive: false
+
   release:
     needs: build
     runs-on: ubuntu-latest
@@ -825,6 +863,14 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: ${{ needs.build.outputs.ak3name }}
+          path: ./release_zips
+          skip-decompress: true
+
+      - name: 下载内核模块工件
+        if: needs.build.outputs.modules_exist == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: kernel-modules
           path: ./release_zips
           skip-decompress: true
 
@@ -901,8 +947,22 @@ jobs:
           #### ※※※刷写内核有风险，为防止出现意外导致手机变砖，在刷入内核前请务必用[KernelFlasher](https://github.com/capntrips/KernelFlasher)等软件备份boot等关键启动分区!※※※
           EOF
 
+          # 若本次构建同时产出了内核模块包, 在发布说明中追加一段说明
+          if [[ "${{ needs.build.outputs.modules_exist }}" == "true" ]]; then
+            cat << 'EOF' >> release_notes.md
+
+          ### 🧩 内核模块包
+          - 附件 KernelModules_*.zip 内含本 config 中编译为 =m 的内核模块，为 modules_install 标准布局(lib/modules/<内核版本>/, 含 modules.dep 依赖表)，整树解压到设备 /lib/modules 对应目录后即可用 modprobe 按名加载。
+          EOF
+          fi
+
+          # 将模块包一并作为 release 资产上传(无 =m 模块时仅上传刷机包)
+          ASSETS=(release_zips/AnyKernel3_*.zip)
+          if ls release_zips/KernelModules*.zip >/dev/null 2>&1; then
+            ASSETS+=(release_zips/KernelModules*.zip)
+          fi
           gh release create "${{ env.TAG_HEAD }}-${{ env.TIME }}" \
             --repo "${{ github.repository }}" \
             --title "${{ env.TAG_HEAD }}-${{ env.FULL_VERSION }}" \
             --notes-file release_notes.md \
-            release_zips/AnyKernel3_*.zip
+            "${ASSETS[@]}"
