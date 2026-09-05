@@ -849,10 +849,18 @@ jobs:
         run: |
           WORKDIR="$(pwd)"
           cd kernel_workspace
-          # 还原 Image 编译现场的环境快照, 与 Image 逐变量一致(重点: KCFLAGS 的 -Wno-error 与 prefix-map, ccache, PATH 工具链)
+          # 还原 Image 编译现场的环境快照(重点: KCFLAGS 的 -Wno-error 与 prefix-map, ccache, PATH 工具链),
+          # 但 GITHUB_OUTPUT 等是 Actions 给每个 step 单独的临时文件, 快照里存的是 Image step 的旧路径,
+          # 若被覆盖, 本 step 的 >>$GITHUB_OUTPUT 会写进失效文件, outputs 传不出去(实测模块打好了上传仍被跳过);
+          # 故 source 前暂存这几个 Actions 运行时变量, source 后再恢复
+          _GH_RESTORE=""
+          for _v in GITHUB_OUTPUT GITHUB_ENV GITHUB_STEP_SUMMARY GITHUB_STATE GITHUB_PATH; do
+            _GH_RESTORE="$_GH_RESTORE export $_v='${!_v}';"
+          done
           set -a
           source modules.env
           set +a
+          eval "$_GH_RESTORE"
           cd common
           # 模块显式用 clang 直编: 快照里 CC 是 cc-wrapper, 其内部 ccache 会拦截 Kconfig 编译器探测参数致 unknown C compiler;
           # 而模块 CRC 取决于符号内容与 prefix-map 路径, 与 Image 的时间劫持无关, clang 直编仍与 Image 一致可加载
@@ -892,6 +900,44 @@ jobs:
           path: ${{ github.workspace }}/kernel_workspace/KernelModules*.zip
           archive: false
 
+      - name: 安装并打包内核头文件(uapi)
+        id: build_headers
+        run: |
+          WORKDIR="$(pwd)"
+          cd kernel_workspace
+          # 还原 Image 编译现场环境(与模块 step 同源, 重点 PATH/KCFLAGS/ccache); 同样先暂存 GITHUB_* 防快照旧值覆盖
+          _GH_RESTORE=""
+          for _v in GITHUB_OUTPUT GITHUB_ENV GITHUB_STEP_SUMMARY GITHUB_STATE GITHUB_PATH; do
+            _GH_RESTORE="$_GH_RESTORE export $_v='${!_v}';"
+          done
+          set -a
+          source modules.env
+          set +a
+          eval "$_GH_RESTORE"
+          cd common
+          # headers_install 把内核 uapi 头安装到 stage/usr/include(与发行版/安卓头文件布局一致);
+          # 附 .config 与 Module.symvers, 供后续对版本/核对模块符号 CRC 参考
+          HDR_STAGE="$WORKDIR/kernel_workspace/headers_stage"
+          rm -rf "$HDR_STAGE"
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out INSTALL_HDR_PATH="$HDR_STAGE/usr" headers_install || {
+            echo "错误: 内核头文件安装失败"; exit 1; }
+          cp out/.config "$HDR_STAGE/" || true
+          cp out/Module.symvers "$HDR_STAGE/" || true
+          HEADERS_TAG="${{ env.KERNEL_NAME }}"
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            HEADERS_TAG="${{ github.event.inputs.kernel_suffix }}"
+          fi
+          HEADERS_ZIP="KernelHeaders_${HEADERS_TAG}.zip"
+          (cd "$HDR_STAGE" && zip -qry "$WORKDIR/kernel_workspace/$HEADERS_ZIP" usr .config Module.symvers)
+          echo "已打包内核头文件: $HEADERS_ZIP $(ls -lh "$WORKDIR/kernel_workspace/$HEADERS_ZIP" | awk '{print $5}')"
+
+      - name: 上传内核头文件工件
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-headers
+          path: ${{ github.workspace }}/kernel_workspace/KernelHeaders*.zip
+          archive: false
+
   release:
     needs: build
     runs-on: ubuntu-latest
@@ -913,6 +959,13 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: kernel-modules
+          path: ./release_zips
+          skip-decompress: true
+
+      - name: 下载内核头文件工件
+        uses: actions/download-artifact@v8
+        with:
+          name: kernel-headers
           path: ./release_zips
           skip-decompress: true
 
@@ -998,10 +1051,13 @@ jobs:
           EOF
           fi
 
-          # 将模块包一并作为 release 资产上传(无 =m 模块时仅上传刷机包)
+          # 将模块包与头文件包一并作为 release 资产上传(模块仅在有 =m 产物时)
           ASSETS=(release_zips/AnyKernel3_*.zip)
           if ls release_zips/KernelModules*.zip >/dev/null 2>&1; then
             ASSETS+=(release_zips/KernelModules*.zip)
+          fi
+          if ls release_zips/KernelHeaders*.zip >/dev/null 2>&1; then
+            ASSETS+=(release_zips/KernelHeaders*.zip)
           fi
           gh release create "${{ env.TAG_HEAD }}-${{ env.TIME }}" \
             --repo "${{ github.repository }}" \
