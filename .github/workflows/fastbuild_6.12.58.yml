@@ -718,6 +718,10 @@ jobs:
           # 关闭 ZRAM: cctv18 树 backend_zstd.c 调用的 zstd_custom_mem 等 API 比树里 zstd.h 新, 仅在 make modules 编 zram.ko 时暴露而编译失败;
           # 原厂本就是 zram=m 模块化, zram 由 vendor 的 zram.ko/zsmalloc.ko(vendor_boot dlkm)提供, 故内核不编 zram 模块既不重复也不触发该错误
           echo "CONFIG_ZRAM=n" >> arch/arm64/configs/gki_defconfig
+          # 只关 Rust binder 模块(保留 RUST=y): 树默认 RUST=y 但 ANDROID_BINDER_IPC_RUST=m, 该模块引用
+          # init_ipc_ns/put_ipc_ns(ipc/namespace.c, 仅 CONFIG_IPC_NS=y 时编入 vmlinux), 而 gki_defconfig IPC_NS=n,
+          # 于是 rust_binder.ko 编出后 modpost 报 undefined; binder rust 是 =m 本就不进 Image, 关掉不影响 boot
+          echo "CONFIG_ANDROID_BINDER_IPC_RUST=n" >> arch/arm64/configs/gki_defconfig
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out gki_defconfig &&
           export CC="$(pwd)/cc-wrapper" && export LD="$(pwd)/ld-wrapper" &&
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out Image
