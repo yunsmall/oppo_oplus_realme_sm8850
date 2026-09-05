@@ -642,7 +642,9 @@ jobs:
           echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> cc-wrapper
           echo 'export FAKESTAT="'$FAKESTAT'"' >> cc-wrapper
           echo 'export FAKETIME="'$FAKETIME'"' >> cc-wrapper
-          echo 'ccache $REAL_CLANG_PATH "$@"' >> cc-wrapper
+          # 带 -c 的真实编译走 ccache; 其余(Kconfig 编译器探测/版本查询/宏收集等, 无 -c)直通真 clang,
+          # 否则 ccache 会把探测参数当自己的选项解析报 invalid option, 使 syncconfig 判 "C compiler not supported"
+          echo 'case " $* " in *" -c "*) exec ccache "$REAL_CLANG_PATH" "$@" ;; *) exec "$REAL_CLANG_PATH" "$@" ;; esac' >> cc-wrapper
           #创建 LD (链接器) 包装器
           echo '#!/bin/bash' > ld-wrapper
           echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> ld-wrapper
@@ -745,13 +747,6 @@ jobs:
           echo "编译后空间:"
           df -h
 
-      - name: 保存新的 ccache 缓存
-        if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ github.ref_name }}
-         
       - name: 应用KPM并修补内核
         if: inputs.kpm_enable
         run: |
@@ -862,16 +857,17 @@ jobs:
           set +a
           eval "$_GH_RESTORE"
           cd common
-          # 模块显式用 clang 直编: 快照里 CC 是 cc-wrapper, 其内部 ccache 会拦截 Kconfig 编译器探测参数致 unknown C compiler;
-          # 而模块 CRC 取决于符号内容与 prefix-map 路径, 与 Image 的时间劫持无关, clang 直编仍与 Image 一致可加载
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out modules || {
+          # 模块与 Image 用同一 CC/LD wrapper 编译: wrapper 已把无 -c 的 Kconfig 探测调用直通真 clang(不走 ccache),
+          # 即使 make 触发 syncconfig 也不再崩; 与 Image 相同的 CC 命令让 Kbuild 判为增量且 ccache 命中 Image 缓存,
+          # 模块不再整树重编, 模块对象也写回 CCACHE_DIR 随缓存一并上传
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out modules || {
             echo "错误: 内核模块编译失败"; exit 1; }
           # 按标准布局安装到 lib/modules/<release> 并跑 depmod 生成 modules.dep 等依赖文件,
           # 这样整树拷到设备的 /lib/modules 后即可用 modprobe 按模块名加载并自动处理依赖
           command -v depmod >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y kmod)
           INSTALL_MOD_PATH="$WORKDIR/kernel_workspace/modules_stage"
           rm -rf "$INSTALL_MOD_PATH"
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out INSTALL_MOD_PATH="$INSTALL_MOD_PATH" INSTALL_MOD_STRIP=1 modules_install || {
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out INSTALL_MOD_PATH="$INSTALL_MOD_PATH" INSTALL_MOD_STRIP=1 modules_install || {
             echo "错误: 内核模块安装(depmod)失败"; exit 1; }
           # 打包整个 modules 树, 命名与内核后缀对齐, 供 release 一并发布
           MODULES_TAG="${{ env.KERNEL_NAME }}"
@@ -937,6 +933,15 @@ jobs:
           name: kernel-headers
           path: ${{ github.workspace }}/kernel_workspace/KernelHeaders*.zip
           archive: false
+
+      # 保存 ccache 必须放在 build job 最末尾: 此刻 CCACHE_DIR 才含全部对象(Image+模块+期间新缓存);
+      # 若像原来那样放在构建内核后立即保存, 其后再编译进缓存的模块对象会永远传不上去
+      - name: 保存新的 ccache 缓存
+        if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ github.ref_name }}
 
   release:
     needs: build
