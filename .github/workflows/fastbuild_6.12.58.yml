@@ -963,14 +963,16 @@ jobs:
         if: needs.build.outputs.modules_exist == 'true'
         uses: actions/download-artifact@v8
         with:
-          name: kernel-modules
+          # upload-artifact@v7 配 archive:false 时 artifact 名是文件 base name(如 KernelModules_<tag>.zip),
+          # name 字段不生效, 故这里按文件名 glob 匹配而非写死的 kernel-modules
+          pattern: KernelModules*
           path: ./release_zips
           skip-decompress: true
 
       - name: 下载内核头文件工件
         uses: actions/download-artifact@v8
         with:
-          name: kernel-headers
+          pattern: KernelHeaders*
           path: ./release_zips
           skip-decompress: true
 
