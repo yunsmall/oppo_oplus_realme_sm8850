@@ -70,14 +70,19 @@ jobs:
       - name: 检查产物
         run: |
           set -e
-          ls -l module-ci/hello_mod/hello.ko
-          modinfo module-ci/hello_mod/hello.ko
-          echo "=== 导入符号 CRC（__versions） ==="
-          readelf -x __versions module-ci/hello_mod/hello.ko | head -20
-          echo "=== CFI 节 ==="
-          readelf -SW module-ci/hello_mod/hello.ko | grep -i cfi || true
+          ls -l module-ci/hello_mod/*.ko
+          for ko in module-ci/hello_mod/hello.ko module-ci/hello_mod/sg_bypass.ko; do
+            echo "=== $ko ==="
+            modinfo "$ko"
+            readelf -x __versions "$ko" | head -12
+          done
+          echo "=== struct module 偏移校验（设备内核: init=392 exit=1528） ==="
+          INIT=$(pahole -C module module-ci/hello_mod/hello.ko | grep '(*init)(void)' | grep -oP '/\*\s+\K[0-9]+')
+          EXIT=$(pahole -C module module-ci/hello_mod/hello.ko | grep '(*exit)(void)' | grep -oP '/\*\s+\K[0-9]+')
+          echo "init=$INIT exit=$EXIT"
+          [ "$INIT" = "392" ] && [ "$EXIT" = "1528" ] || { echo "OFFSET MISMATCH: 配置与设备内核不一致"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ace6t-hello-module
-          path: module-ci/hello_mod/hello.ko
+          name: ace6t-modules
+          path: module-ci/hello_mod/*.ko
