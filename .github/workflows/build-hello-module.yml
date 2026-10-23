@@ -1,0 +1,79 @@
+name: 编译 Ace 6T 内核模块 (hello 测试)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-module:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            aria2 unzip zip bc bison flex libssl-dev libelf-dev libdw-dev \
+            cpio xz-utils lz4 zstd python3 perl make gcc kmod dwarves
+
+      - name: 下载内核源码和工具链
+        run: |
+          set -e
+          aria2c -s16 -x16 -k1M -o common.tar.gz \
+            "https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8845/archive/refs/heads/oneplus/sm8845_b_16.0.0_ace_6t.tar.gz"
+          mkdir -p common
+          tar xzf common.tar.gz -C common --strip-components=1
+          rm -f common.tar.gz
+
+          aria2c -s16 -x16 -k1M -o clang.zip \
+            "https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/clang-r536225.zip"
+          mkdir -p clang19
+          unzip -q clang.zip -d clang19
+          rm -f clang.zip
+
+          aria2c -s16 -x16 -k1M -o rust.zip \
+            "https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/rust.zip"
+          mkdir -p rust
+          unzip -q rust.zip -d rust
+          rm -f rust.zip
+
+          aria2c -s16 -x16 -k1M -o build-tools.zip \
+            "https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang19-r536225/build-tools.zip"
+          mkdir -p build-tools
+          unzip -q build-tools.zip -d build-tools
+          rm -f build-tools.zip
+
+      - name: 准备内核树并编译模块
+        run: |
+          set -e
+          export PATH="$GITHUB_WORKSPACE/clang19/bin:$GITHUB_WORKSPACE/build-tools/bin:$GITHUB_WORKSPACE/rust/bin:$PATH"
+          export CC="$GITHUB_WORKSPACE/clang19/bin/clang"
+          export HOSTCC="$GITHUB_WORKSPACE/clang19/bin/clang"
+          export LD=ld.lld HOSTLD=ld.lld AR=llvm-ar NM=llvm-nm AS=clang READELF=llvm-readelf
+          export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump OBJSIZE=llvm-size STRIP=llvm-strip
+          export LLVM=1 LLVM_IAS=1 ARCH=arm64 SUBARCH=arm64
+          export KCFLAGS="-D__ANDROID_COMMON_KERNEL__ -Wno-error"
+
+          # 设备原版配置 + 从运行内核提取的符号 CRC 表
+          mkdir -p common/out
+          cp module-ci/device/ace6t_defconfig common/out/.config
+          make -C common O=out olddefconfig
+          make -C common O=out modules_prepare
+          cp module-ci/device/Module.symvers common/out/Module.symvers
+
+          make -C common O=out M="$GITHUB_WORKSPACE/module-ci/hello_mod" modules
+
+      - name: 检查产物
+        run: |
+          set -e
+          ls -l module-ci/hello_mod/hello.ko
+          modinfo module-ci/hello_mod/hello.ko
+          echo "=== 导入符号 CRC（__versions） ==="
+          readelf -x __versions module-ci/hello_mod/hello.ko | head -20
+          echo "=== CFI 节 ==="
+          readelf -SW module-ci/hello_mod/hello.ko | grep -i cfi || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ace6t-hello-module
+          path: module-ci/hello_mod/hello.ko
